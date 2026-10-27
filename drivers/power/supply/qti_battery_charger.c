@@ -16,6 +16,7 @@
 #include <linux/reboot.h>
 #include <linux/rpmsg.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/pm_wakeup.h>
 #include <linux/power_supply.h>
 #include <linux/soc/qcom/pmic_glink.h>
@@ -437,6 +438,11 @@ struct battery_chg_dev {
 	struct pmic_glink_client	*client;
 	struct typec_role_class		*typec_class;
 	struct mutex			rw_lock;
+	spinlock_t			ack_lock;
+	u32				pending_opcode;
+	u32				pending_property;
+	bool				pending_has_property;
+	bool				request_pending;
 	struct completion		ack;
 	struct completion		fw_buf_ack;
 	struct completion		fw_update_ack;
@@ -622,10 +628,63 @@ static int battery_chg_fw_write(struct battery_chg_dev *bcdev, void *data,
 			(((u32)(x) & 0x0000ff00) << 8) | \
 			(((u32)(x) & 0x000000ff) << 24))
 
+static int battery_chg_request_property(void *data, int len, u32 *property,
+					bool *has_property)
+{
+	struct pmic_glink_hdr *hdr = data;
+	struct battery_charger_req_msg *req = data;
+
+	if (len < (int)sizeof(*hdr))
+		return -EINVAL;
+
+	*has_property = false;
+	switch (hdr->opcode) {
+	case BC_BATTERY_STATUS_GET:
+	case BC_BATTERY_STATUS_SET:
+	case BC_USB_STATUS_GET:
+	case BC_USB_STATUS_SET:
+	case BC_WLS_STATUS_GET:
+	case BC_WLS_STATUS_SET:
+	case BC_XM_STATUS_GET:
+	case BC_XM_STATUS_SET:
+		*has_property = true;
+		if (len == sizeof(*req)) {
+			*property = req->property_id;
+			return 0;
+		}
+
+		/* Xiaomi extension packets omit the standard battery_id. */
+		if (((hdr->opcode == BC_WLS_STATUS_GET ||
+		      hdr->opcode == BC_WLS_STATUS_SET) &&
+		     len == sizeof(struct wls_fw_resp_msg)) ||
+		    ((hdr->opcode == BC_XM_STATUS_GET ||
+		      hdr->opcode == BC_XM_STATUS_SET) &&
+		     (len == sizeof(struct xm_verify_digest_resp_msg) ||
+		      len == sizeof(struct xm_ss_auth_resp_msg) ||
+		      len == sizeof(struct xm_set_wls_bin_req_msg)))) {
+			memcpy(property, (u8 *)data + sizeof(*hdr),
+			       sizeof(*property));
+			return 0;
+		}
+		return -EINVAL;
+	default:
+		/* Notify, shutdown and firmware requests have no property ID. */
+		return 0;
+	}
+}
+
 static int battery_chg_write(struct battery_chg_dev *bcdev, void *data,
 				int len)
 {
+	struct pmic_glink_hdr *hdr = data;
+	unsigned long flags;
+	u32 property = 0;
+	bool has_property;
 	int rc;
+
+	rc = battery_chg_request_property(data, len, &property, &has_property);
+	if (rc)
+		return rc;
 
 	/*
 	 * When the subsystem goes down, it's better to return the last
@@ -641,19 +700,28 @@ static int battery_chg_write(struct battery_chg_dev *bcdev, void *data,
 		return 0;
 
 	mutex_lock(&bcdev->rw_lock);
+	spin_lock_irqsave(&bcdev->ack_lock, flags);
 	reinit_completion(&bcdev->ack);
+	bcdev->pending_opcode = hdr->opcode;
+	bcdev->pending_property = property;
+	bcdev->pending_has_property = has_property;
+	bcdev->request_pending = true;
+	spin_unlock_irqrestore(&bcdev->ack_lock, flags);
+
 	rc = pmic_glink_write(bcdev->client, data, len);
 	if (!rc) {
 		rc = wait_for_completion_timeout(&bcdev->ack,
 					msecs_to_jiffies(BC_WAIT_TIME_MS));
 		if (!rc) {
 			pr_err("Error, timed out sending message\n");
-			mutex_unlock(&bcdev->rw_lock);
-			return -ETIMEDOUT;
+			rc = -ETIMEDOUT;
+		} else {
+			rc = 0;
 		}
-
-		rc = 0;
 	}
+	spin_lock_irqsave(&bcdev->ack_lock, flags);
+	bcdev->request_pending = false;
+	spin_unlock_irqrestore(&bcdev->ack_lock, flags);
 	mutex_unlock(&bcdev->rw_lock);
 
 	return rc;
@@ -954,7 +1022,25 @@ static void handle_message(struct battery_chg_dev *bcdev, void *data,
 	struct wireless_fw_update_status *fw_update_msg;
 	struct wireless_fw_get_version_resp *fw_ver_msg;
 	struct psy_state *pst;
+	unsigned long flags = 0;
+	bool async_fw;
 	bool ack_set = false;
+
+	if (len < sizeof(resp_msg->hdr))
+		return;
+
+	async_fw = resp_msg->hdr.opcode == BC_WLS_FW_PUSH_BUF_RESP ||
+		   resp_msg->hdr.opcode == BC_WLS_FW_UPDATE_STATUS_RESP;
+	if (!async_fw) {
+		spin_lock_irqsave(&bcdev->ack_lock, flags);
+		if (!bcdev->request_pending ||
+		    resp_msg->hdr.opcode != bcdev->pending_opcode)
+			goto unlock;
+		if (bcdev->pending_has_property &&
+		    (len < sizeof(resp_msg->hdr) + sizeof(resp_msg->property_id) ||
+		     resp_msg->property_id != bcdev->pending_property))
+			goto unlock;
+	}
 
 	switch (resp_msg->hdr.opcode) {
 	case BC_BATTERY_STATUS_GET:
@@ -1103,8 +1189,13 @@ static void handle_message(struct battery_chg_dev *bcdev, void *data,
 		break;
 	}
 
-	if (ack_set)
+	if (ack_set) {
+		bcdev->request_pending = false;
 		complete(&bcdev->ack);
+	}
+unlock:
+	if (!async_fw)
+		spin_unlock_irqrestore(&bcdev->ack_lock, flags);
 }
 
 static void battery_chg_update_uusb_type(struct battery_chg_dev *bcdev,
@@ -1275,6 +1366,9 @@ static int battery_chg_callback(void *priv, void *data, size_t len)
 {
 	struct pmic_glink_hdr *hdr = data;
 	struct battery_chg_dev *bcdev = priv;
+
+	if (len < sizeof(*hdr))
+		return -EINVAL;
 
 	pr_debug("owner: %u type: %u opcode: %#x len: %zu\n", hdr->owner,
 		hdr->type, hdr->opcode, len);
@@ -5718,6 +5812,7 @@ static int battery_chg_probe(struct platform_device *pdev)
 		devm_kzalloc(&pdev->dev, MAX_STR_LEN, GFP_KERNEL);
 
 	mutex_init(&bcdev->rw_lock);
+	spin_lock_init(&bcdev->ack_lock);
 	init_completion(&bcdev->ack);
 	init_completion(&bcdev->fw_buf_ack);
 	init_completion(&bcdev->fw_update_ack);
