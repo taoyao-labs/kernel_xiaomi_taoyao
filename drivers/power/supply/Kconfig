@@ -418,6 +418,16 @@ config QTI_BATTERY_CHARGER
 	  To compile the driver as a module, choose M here: the module will be
 	  called qti_battery_charger.
 
+config QTI_BATTERY_TAOYAO_STOCK
+	bool "Xiaomi taoyao stock battery power-mode compatibility"
+	depends on QTI_BATTERY_CHARGER=y && BQ_FUEL_GAUGE && BQ2597X
+	depends on !DUAL_FUEL_GAUGE && !MI_WIRELESS
+	help
+	  Reproduce the stock taoyao battery properties, power-mode control,
+	  state-of-charge conversion, and charger diagnostic event interface.
+	  Select this only for the taoyao device and its stock PMIC firmware.
+	  The diagnostic interface provides /dev/miev for PMIC event reports.
+
 config BQ2597X
 	bool "BQ2597X charger"
 	depends on QTI_BATTERY_CHARGER

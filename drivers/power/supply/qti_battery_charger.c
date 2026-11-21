@@ -16,6 +16,7 @@
 #include <linux/reboot.h>
 #include <linux/rpmsg.h>
 #include <linux/mutex.h>
+#include <linux/math64.h>
 #include <linux/spinlock.h>
 #include <linux/pm_wakeup.h>
 #include <linux/power_supply.h>
@@ -27,6 +28,7 @@
 #include <linux/hwid.h>
 #include <drm/mi_disp_notifier.h>
 #include "qti_typec_class.h"
+#include "qti_battery_taoyao_miev.h"
 
 #define MSG_OWNER_BC			32778
 #define MSG_TYPE_REQ_RESP		1
@@ -270,7 +272,9 @@ enum xm_property_id {
 	/* use for MI SMART INTERCHG */
 	XM_PROP_VDM_CMD_SINK_SOC,
 	/*****************/
+#if defined(CONFIG_MI_WIRELESS) || !defined(CONFIG_QTI_BATTERY_TAOYAO_STOCK)
 	XM_PROP_WLS_BIN,
+#endif
 	XM_PROP_FASTCHGMODE,
 	XM_PROP_APDO_MAX,
 	XM_PROP_THERMAL_REMOVE,
@@ -300,7 +304,15 @@ enum xm_property_id {
 	XM_PROP_FG1_TAMBIENT,
 	XM_PROP_FG1_TREMQ,
 	XM_PROP_FG1_TFULLQ,
+#ifdef CONFIG_QTI_BATTERY_TAOYAO_STOCK
+	XM_PROP_SHIPMODE_COUNT_RESET,
+	XM_PROP_SPORT_MODE,
+	XM_PROP_FG1_RSOC,
+	XM_PROP_FG1_AI,
+	XM_PROP_LAST_NODE,
+#else
 	XM_PROP_FG_UPDATE_TIME,
+#endif
 	XM_PROP_MAX,
 };
 
@@ -1312,7 +1324,7 @@ static void battery_chg_fb_notifier_work(struct work_struct *work)
 	int rc;
 
 	rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
-			XM_PROP_FB_BLANK_STATE, bcdev->blank_state);
+			XM_PROP_FB_BLANK_STATE, READ_ONCE(bcdev->blank_state));
 }
 
 static void handle_notification(struct battery_chg_dev *bcdev, void *data,
@@ -1362,6 +1374,33 @@ static void handle_notification(struct battery_chg_dev *bcdev, void *data,
 	}
 }
 
+#ifdef CONFIG_QTI_BATTERY_TAOYAO_STOCK
+/* Stock XM status packets of this size carry an unsolicited ADSP report. */
+struct taoyao_dfx_report {
+	struct pmic_glink_hdr hdr;
+	u32 property_id;
+	u32 event;
+	u32 data[5];
+};
+
+static void taoyao_handle_dfx_report(struct battery_chg_dev *bcdev,
+				     const struct taoyao_dfx_report *report)
+{
+	u8 event = report->event;
+
+	BUILD_BUG_ON(sizeof(struct taoyao_dfx_report) != 40);
+	BUILD_BUG_ON(offsetof(struct taoyao_dfx_report, event) != 16);
+	BUILD_BUG_ON(offsetof(struct taoyao_dfx_report, data) != 20);
+
+	if (!event || event > 40) {
+		dev_warn_ratelimited(bcdev->dev,
+			"Unknown ADSP charger report %u\n", event);
+		return;
+	}
+	taoyao_miev_dfx_report(event, report->data[0], report->data[1]);
+}
+#endif
+
 static int battery_chg_callback(void *priv, void *data, size_t len)
 {
 	struct pmic_glink_hdr *hdr = data;
@@ -1379,6 +1418,13 @@ static int battery_chg_callback(void *priv, void *data, size_t len)
 		return 0;
 	}
 
+#ifdef CONFIG_QTI_BATTERY_TAOYAO_STOCK
+	if (hdr->opcode == BC_XM_STATUS_GET &&
+	    len == sizeof(struct taoyao_dfx_report)) {
+		taoyao_handle_dfx_report(bcdev, data);
+		return 0;
+	}
+#endif
 	if (hdr->opcode == BC_NOTIFY_IND)
 		handle_notification(bcdev, data, len);
 	else
@@ -1540,10 +1586,10 @@ struct quick_charge adapter_cap[11] = {
 #define ADAPTER_XIAOMI_PD_50W     0xe
 #define ADAPTER_XIAOMI_PD_60W     0xf
 #define ADAPTER_XIAOMI_PD_100W    0x10
-static u8 get_quick_charge_type(struct battery_chg_dev *bcdev)
+static int get_quick_charge_type(struct battery_chg_dev *bcdev)
 {
 	int i = 0,verify_digiest = 0;
-	u8 rc;
+	int rc;
 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_BATTERY];
 	enum power_supply_usb_type		real_charger_type = 0;
 	int		batt_health;
@@ -1563,13 +1609,19 @@ static u8 get_quick_charge_type(struct battery_chg_dev *bcdev)
 	real_charger_type = pst->prop[USB_REAL_TYPE];
 	pst = &bcdev->psy_list[PSY_TYPE_XM];
 	rc = read_property_id(bcdev, pst, XM_PROP_PD_VERIFED);
+	if (rc < 0)
+		return rc;
 	verify_digiest = pst->prop[XM_PROP_PD_VERIFED];
 
 	rc = read_property_id(bcdev, pst, XM_PROP_APDO_MAX);
+	if (rc < 0)
+		return rc;
 	apdo_max =  pst->prop[XM_PROP_APDO_MAX];
 
 #if defined(CONFIG_MI_WIRELESS)
 	rc = read_property_id(bcdev, pst, XM_PROP_TX_ADAPTER);
+	if (rc < 0)
+		return rc;
 	tx_adapter = pst->prop[XM_PROP_TX_ADAPTER];
 #endif
 
@@ -1644,7 +1696,10 @@ static int usb_psy_get_prop(struct power_supply *psy,
 	pval->intval = -ENODATA;
 	if (prop == POWER_SUPPLY_PROP_QUICK_CHARGE_TYPE)
 	{
-		pval->intval = get_quick_charge_type(bcdev);
+		rc = get_quick_charge_type(bcdev);
+		if (rc < 0)
+			return rc;
+		pval->intval = rc;
 		return 0;
 	}
 
@@ -1764,8 +1819,10 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 {
 	int rc;
 //	u32 fcc_ua, prev_fcc_ua;
+#ifndef CONFIG_QTI_BATTERY_TAOYAO_STOCK
 	if(val == bcdev->curr_thermal_level)
 	      return 0;
+#endif
 	pr_err("set thermal-level: %d num_thermal_levels: %d \n", val, bcdev->num_thermal_levels);
 
 	if (!bcdev->num_thermal_levels)
@@ -1784,7 +1841,12 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 	if (rc < 0)
 		pr_err("Failed to set ccl:%d, rc=%d\n", val, rc);
 
+#ifdef CONFIG_QTI_BATTERY_TAOYAO_STOCK
+	if (!rc)
+		bcdev->curr_thermal_level = val;
+#else
 	bcdev->curr_thermal_level = val;
+#endif
 #if 0
 	fcc_ua = bcdev->thermal_levels[val];
 	prev_fcc_ua = bcdev->thermal_fcc_ua;
@@ -1800,6 +1862,77 @@ static int battery_psy_set_charge_current(struct battery_chg_dev *bcdev,
 #endif
 	return rc;
 }
+
+#ifdef CONFIG_QTI_BATTERY_TAOYAO_STOCK
+/* Recovered from the stock kernel's mi_power_save_battery_cave(). */
+static u8 taoyao_power_mode = 1;
+
+static ssize_t power_mode_show(struct class *class,
+			       struct class_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%u\n", READ_ONCE(taoyao_power_mode));
+}
+
+static ssize_t power_mode_store(struct class *class,
+				struct class_attribute *attr,
+				const char *buf, size_t count)
+{
+	unsigned long long mode;
+
+	if (kstrtoull(buf, 10, &mode))
+		return -EINVAL;
+	WRITE_ONCE(taoyao_power_mode, (u8)mode);
+	return count;
+}
+static struct class_attribute class_attr_power_mode =
+	__ATTR(power_mode, 0664, power_mode_show, power_mode_store);
+
+static void taoyao_power_class_destroy(void *data)
+{
+	struct class *class = data;
+
+	class_remove_file(class, &class_attr_power_mode);
+	class_destroy(class);
+}
+
+static int taoyao_power_class_init(struct device *dev)
+{
+	struct class *class;
+	int rc;
+
+	BUILD_BUG_ON(XM_PROP_SOC_DECIMAL != 5);
+	BUILD_BUG_ON(XM_PROP_FASTCHGMODE != 62);
+	BUILD_BUG_ON(XM_PROP_APDO_MAX != 63);
+	BUILD_BUG_ON(XM_PROP_FG1_RM != 79);
+	BUILD_BUG_ON(XM_PROP_SHIPMODE_COUNT_RESET != 91);
+	BUILD_BUG_ON(XM_PROP_LAST_NODE != 95);
+	BUILD_BUG_ON(XM_PROP_MAX != 96);
+
+	class = class_create(THIS_MODULE, "power_debug");
+	if (IS_ERR(class))
+		return PTR_ERR(class);
+	rc = class_create_file(class, &class_attr_power_mode);
+	if (rc) {
+		class_destroy(class);
+		return rc;
+	}
+	return devm_add_action_or_reset(dev, taoyao_power_class_destroy, class);
+}
+
+static int taoyao_power_save_soc(int soc)
+{
+	u8 mode = READ_ONCE(taoyao_power_mode);
+	s64 adjusted = soc;
+
+	if (mode < 2 || mode > 4)
+		return soc;
+	if (soc >= 21)
+		adjusted = div_s64((s64)soc * 100 - 1894, 107) + 25;
+	else if (soc >= 0)
+		adjusted = div_s64((s64)soc * 100 + 79, 80);
+	return clamp_t(s64, adjusted, 0, 100);
+}
+#endif
 
 static int battery_psy_get_prop(struct power_supply *psy,
 		enum power_supply_property prop,
@@ -1842,6 +1975,10 @@ static int battery_psy_get_prop(struct power_supply *psy,
 		if(bcdev->fake_soc >= 0 && bcdev->fake_soc <= 100)
 			pval->intval = bcdev->fake_soc;
 
+#ifdef CONFIG_QTI_BATTERY_TAOYAO_STOCK
+		pval->intval = taoyao_power_save_soc(pval->intval);
+#endif
+
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
 #if defined(CONFIG_BQ_FUEL_GAUGE)
@@ -1859,8 +1996,8 @@ static int battery_psy_get_prop(struct power_supply *psy,
 		break;
 #ifdef CONFIG_BQ_FUEL_GAUGE
 	case POWER_SUPPLY_PROP_TIME_TO_FULL_AVG:
-		pval->intval = (pst->prop[prop_id] * 60) >= 65535 ?
-			65535 : (pst->prop[prop_id] * 60);
+		/* Firmware reports minutes; power_supply and Android use seconds. */
+		pval->intval = min_t(u64, (u64)pst->prop[prop_id] * 60, 65535);
 		break;
 #endif
 	default:
@@ -1981,7 +2118,8 @@ static int power_supply_read_temp(struct thermal_zone_device *tzd,
 
 	*temp = batt_temp * 1000;
 	pr_err("batt_thermal temp:%d ,delta:%ld blank_state=%d chg_type=%s tl:=%d  ffc:=%d, pd_verifed:=%d\n",
-		batt_temp,delta, bcdev->blank_state, power_supply_usb_type_text[pst->prop[XM_PROP_REAL_TYPE]],
+		batt_temp, delta, bcdev->blank_state,
+		get_usb_type_name(pst->prop[XM_PROP_REAL_TYPE]),
 		bcdev->curr_thermal_level, pst->prop[XM_PROP_FASTCHGMODE], pst->prop[XM_PROP_PD_VERIFED]);
 	return 0;
 }
@@ -2829,26 +2967,19 @@ static ssize_t verify_digest_store(struct class *c,
 						battery_class);
 	u8 random[BATTERY_DIGEST_LEN] = {0};
 	char kbuf[2 * BATTERY_DIGEST_LEN + 1] = {0};
-	u8 random_1s[BATTERY_DIGEST_LEN] = {0};
-	char kbuf_1s[70] = {0};
+	size_t len;
+	unsigned int converted;
 	int rc;
-	int i;
 
-	if (bcdev->support_2s_charging) {
-		memset(kbuf, 0, sizeof(kbuf));
-		strlcpy(kbuf, buf, 2 * BATTERY_DIGEST_LEN + 1);
-		StringToHex(kbuf, random, &i);
-		pr_err("verify_digest_store  2s:%s \n", random);
-		rc = write_verify_digest_prop_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
-				XM_PROP_VERIFY_DIGEST, random);
-	} else {
-		memset(kbuf_1s, 0, sizeof(kbuf_1s));
-		strncpy(kbuf_1s, buf, count - 1);
-		StringToHex(kbuf_1s, random_1s, &i);
-		pr_err("verify_digest_store  1s:%s \n", random_1s);
-		rc = write_verify_digest_prop_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
-				XM_PROP_VERIFY_DIGEST, random_1s);
-	}
+	/* Stock 1S drops the final character; 2S consumes up to 64. */
+	len = count;
+	if (!bcdev->support_2s_charging && len)
+		len--;
+	len = min_t(size_t, len, sizeof(kbuf) - 1);
+	memcpy(kbuf, buf, len);
+	StringToHex(kbuf, random, &converted);
+	rc = write_verify_digest_prop_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
+					 XM_PROP_VERIFY_DIGEST, random);
 	if (rc < 0)
 		return rc;
 
@@ -3039,7 +3170,11 @@ static ssize_t connector_temp_show(struct class *c,
 	if (rc < 0)
 		return rc;
 
+#ifdef CONFIG_QTI_BATTERY_TAOYAO_STOCK
+	return scnprintf(buf, PAGE_SIZE, "%d\n", (s32)pst->prop[XM_PROP_CONNECTOR_TEMP]);
+#else
 	return scnprintf(buf, PAGE_SIZE, "%u\n", pst->prop[XM_PROP_CONNECTOR_TEMP]);
+#endif
 }
 static CLASS_ATTR_RW(connector_temp);
 
@@ -4670,17 +4805,16 @@ static ssize_t request_vdm_cmd_store(struct class *c,
 {
 	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
 						battery_class);
-	int cmd, ret;
-	unsigned char buffer[64];
-	unsigned char data[32];
-	int ccount;
+	int cmd;
+	char buffer[65] = {0};
+	u32 data[8] = {0};
+	unsigned int ccount;
 
-	ret = sscanf(buf, "%d,%s\n", &cmd, buffer);
+	if (sscanf(buf, "%d,%64s", &cmd, buffer) != 2)
+		return -EINVAL;
 
-	pr_info("%s:buf:%s cmd:%d, buffer:%s\n", __func__, buf, cmd, buffer);
-
-	StringToHex(buffer, data, &ccount);
-	usbpd_request_vdm_cmd(bcdev, cmd, (unsigned int *)data);
+	StringToHex(buffer, (u8 *)data, &ccount);
+	usbpd_request_vdm_cmd(bcdev, cmd, data);
 	return count;
 }
 
@@ -5295,6 +5429,57 @@ static ssize_t fg1_tfullq_show(struct class *c,
 }
 static CLASS_ATTR_RO(fg1_tfullq);
 
+#ifdef CONFIG_QTI_BATTERY_TAOYAO_STOCK
+/* Property numbers and access modes recovered from the stock taoyao module. */
+#define XM_STOCK_ATTR_RO(_name, _prop, _format)                          \
+static ssize_t _name##_show(struct class *c,                            \
+			    struct class_attribute *attr, char *buf)           \
+{                                                                      \
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev, \
+						 battery_class);                \
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_XM];            \
+	int rc = read_property_id(bcdev, pst, _prop);                     \
+	if (rc < 0)                                                       \
+		return rc;                                                \
+	return scnprintf(buf, PAGE_SIZE, _format "\n", pst->prop[_prop]); \
+}                                                                      \
+static CLASS_ATTR_RO(_name)
+
+#define XM_STOCK_ATTR_RW(_name, _prop)                                  \
+static ssize_t _name##_show(struct class *c,                            \
+			    struct class_attribute *attr, char *buf)           \
+{                                                                      \
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev, \
+						 battery_class);                \
+	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_XM];            \
+	int rc = read_property_id(bcdev, pst, _prop);                     \
+	if (rc < 0)                                                       \
+		return rc;                                                \
+	return scnprintf(buf, PAGE_SIZE, "%u\n", pst->prop[_prop]);       \
+}                                                                      \
+static ssize_t _name##_store(struct class *c,                           \
+			     struct class_attribute *attr,                     \
+			     const char *buf, size_t count)                    \
+{                                                                      \
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev, \
+						 battery_class);                \
+	int value, rc;                                                    \
+	rc = kstrtoint(buf, 10, &value);                                  \
+	if (rc < 0)                                                       \
+		return rc;                                                \
+	rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],      \
+			       _prop, value);                                     \
+	return rc < 0 ? rc : count;                                      \
+}                                                                      \
+static CLASS_ATTR_RW(_name)
+
+XM_STOCK_ATTR_RW(shipmode_count_reset, XM_PROP_SHIPMODE_COUNT_RESET);
+XM_STOCK_ATTR_RW(sport_mode, XM_PROP_SPORT_MODE);
+XM_STOCK_ATTR_RO(fg1_rsoc, XM_PROP_FG1_RSOC, "%d");
+XM_STOCK_ATTR_RO(fg1_ai, XM_PROP_FG1_AI, "%d");
+XM_STOCK_ATTR_RO(last_node, XM_PROP_LAST_NODE, "%u");
+#endif
+
 static struct attribute *battery_class_attrs[] = {
 	&class_attr_soh.attr,
 	&class_attr_resistance.attr,
@@ -5427,6 +5612,13 @@ static struct attribute *battery_class_attrs[] = {
 	&class_attr_fg1_tambient.attr,
 	&class_attr_fg1_tremq.attr,
 	&class_attr_fg1_tfullq.attr,
+#ifdef CONFIG_QTI_BATTERY_TAOYAO_STOCK
+	&class_attr_shipmode_count_reset.attr,
+	&class_attr_sport_mode.attr,
+	&class_attr_fg1_rsoc.attr,
+	&class_attr_fg1_ai.attr,
+	&class_attr_last_node.attr,
+#endif
 	&class_attr_power_max.attr,
 	NULL,
 };
@@ -5482,13 +5674,17 @@ static void generate_xm_charge_uvent(struct work_struct *work)
 		"POWER_SUPPLY_SOC_DECIMAL=\n",	//length=31+8
 		"POWER_SUPPLY_SOC_DECIMAL_RATE=\n",	//length=31+8
 		"POWER_SUPPLY_SHUTDOWN_DELAY=\n",//28+8
+#if defined(CONFIG_MI_WIRELESS) || !defined(CONFIG_QTI_BATTERY_TAOYAO_STOCK)
 		"POWER_SUPPLY_VBUS_DISABLE=\n",//length=26+1
+#endif
 	};
 	static char *envp[] = {
 		uevent_string[0],
 		uevent_string[1],
 		uevent_string[2],
+#if defined(CONFIG_MI_WIRELESS) || !defined(CONFIG_QTI_BATTERY_TAOYAO_STOCK)
 		uevent_string[3],
+#endif
 #if defined(CONFIG_MI_WIRELESS)
 		uevent_string[4],
 		uevent_string[5],
@@ -5550,11 +5746,15 @@ static void generate_xm_charge_uvent(struct work_struct *work)
 	shutdown_delay_show( &(bcdev->battery_class), NULL, prop_buf);
 	strncpy( uevent_string[2]+28, prop_buf,MAX_UEVENT_LENGTH-28);
 
+#ifndef CONFIG_QTI_BATTERY_TAOYAO_STOCK
 	vbus_disable_show( &(bcdev->battery_class), NULL, prop_buf);
 	strncpy( uevent_string[3]+26, prop_buf,MAX_UEVENT_LENGTH-26);
-
 	dev_err(bcdev->dev,"uevent test : %s\n %s\n %s\n %s\n",
-			envp[0], envp[1], envp[2],envp[3]);
+			envp[0], envp[1], envp[2], envp[3]);
+#else
+	dev_err(bcdev->dev, "uevent test : %s\n %s\n %s\n",
+			envp[0], envp[1], envp[2]);
+#endif
 #endif
 
 	/*add our prop end*/
@@ -5691,7 +5891,9 @@ static int fb_notifier_callback(struct notifier_block *nb,
 						     fb_notifier);
 	struct mi_disp_notifier *evdata = data;
 	unsigned int blank;
+#ifndef CONFIG_QTI_BATTERY_TAOYAO_STOCK
 	int rc;
+#endif
 
 	if(val != MI_DISP_DPMS_EVENT)
 		return NOTIFY_OK;
@@ -5702,15 +5904,19 @@ static int fb_notifier_callback(struct notifier_block *nb,
 
 		if ((blank == MI_DISP_DPMS_POWERDOWN ||
 			blank == MI_DISP_DPMS_LP1 || blank == MI_DISP_DPMS_LP2)) {
-			bcdev->blank_state = FB_BLANK;
+			WRITE_ONCE(bcdev->blank_state, FB_BLANK);
 		} else if (blank == MI_DISP_DPMS_ON) {
-			bcdev->blank_state = FB_UNBLANK;
+			WRITE_ONCE(bcdev->blank_state, FB_UNBLANK);
 		}
 
+#ifdef CONFIG_QTI_BATTERY_TAOYAO_STOCK
+		schedule_work(&bcdev->fb_notifier_work);
+#else
 		rc = write_property_id(bcdev, &bcdev->psy_list[PSY_TYPE_XM],
 				XM_PROP_FB_BLANK_STATE, bcdev->blank_state);
 		if (rc < 0)
 			return rc;
+#endif
 	}
 	return NOTIFY_OK;
 }
@@ -5819,6 +6025,9 @@ static int battery_chg_probe(struct platform_device *pdev)
 	INIT_WORK(&bcdev->subsys_up_work, battery_chg_subsys_up_work);
 	INIT_WORK(&bcdev->usb_type_work, battery_chg_update_usb_type_work);
 	INIT_WORK(&bcdev->fb_notifier_work, battery_chg_fb_notifier_work);
+	INIT_DELAYED_WORK(&bcdev->xm_prop_change_work, generate_xm_charge_uvent);
+	INIT_DELAYED_WORK(&bcdev->charger_debug_info_print_work,
+			  xm_charger_debug_info_print_work);
 
 	atomic_set(&bcdev->state, PMIC_GLINK_STATE_UP);
 	bcdev->dev = dev;
@@ -5865,6 +6074,11 @@ static int battery_chg_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, bcdev);
 	sbcdev = bcdev;
 	bcdev->fake_soc = -EINVAL;
+#ifdef CONFIG_QTI_BATTERY_TAOYAO_STOCK
+	rc = taoyao_power_class_init(dev);
+	if (rc < 0)
+		goto error;
+#endif
 	rc = battery_chg_init_psy(bcdev);
 	if (rc < 0)
 		goto error;
@@ -5895,8 +6109,6 @@ static int battery_chg_probe(struct platform_device *pdev)
 
 	schedule_work(&bcdev->usb_type_work);
 
-	INIT_DELAYED_WORK( &bcdev->xm_prop_change_work, generate_xm_charge_uvent);
-	INIT_DELAYED_WORK( &bcdev->charger_debug_info_print_work, xm_charger_debug_info_print_work);
 	schedule_delayed_work(&bcdev->charger_debug_info_print_work, 5 * HZ);
 
 	bcdev->slave_fg_verify_flag = false;
@@ -5913,8 +6125,11 @@ static int battery_chg_probe(struct platform_device *pdev)
 error:
 	bcdev->initialized = false;
 	complete(&bcdev->ack);
-	pmic_glink_unregister_client(bcdev->client);
 	mi_disp_unregister_client(&bcdev->fb_notifier);
+#ifdef CONFIG_QTI_BATTERY_TAOYAO_STOCK
+	cancel_work_sync(&bcdev->fb_notifier_work);
+#endif
+	pmic_glink_unregister_client(bcdev->client);
 	unregister_reboot_notifier(&bcdev->reboot_notifier);
 	return rc;
 }
@@ -5928,6 +6143,9 @@ static int battery_chg_remove(struct platform_device *pdev)
 	debugfs_remove_recursive(bcdev->debugfs_dir);
 	class_unregister(&bcdev->battery_class);
 	mi_disp_unregister_client(&bcdev->fb_notifier);
+#ifdef CONFIG_QTI_BATTERY_TAOYAO_STOCK
+	cancel_work_sync(&bcdev->fb_notifier_work);
+#endif
 	unregister_reboot_notifier(&bcdev->reboot_notifier);
 	qti_typec_class_deinit(bcdev->typec_class);
 	rc = pmic_glink_unregister_client(bcdev->client);
