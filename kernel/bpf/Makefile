@@ -39,3 +39,5 @@ obj-$(CONFIG_BPF_PRELOAD) += preload/
 ifeq ($(CONFIG_FUSE_BPF),y)
 obj-$(CONFIG_BPF_SYSCALL) += bpf_fuse.o
 endif
+
+obj-$(CONFIG_DEBUG_INFO_BTF_SYSFS) += sysfs_btf.o

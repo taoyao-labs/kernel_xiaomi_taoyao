@@ -264,6 +264,15 @@ config DEBUG_INFO_BTF
 	  Turning this on expects presence of pahole tool, which will convert
 	  DWARF type info into equivalent deduplicated BTF type info.
 
+config DEBUG_INFO_BTF_SYSFS
+	bool "Export kernel BTF for userspace CO-RE"
+	depends on DEBUG_INFO && BPF_SYSCALL && SYSFS
+	depends on !DEBUG_INFO_BTF && !DEBUG_INFO_SPLIT && !DEBUG_INFO_REDUCED
+	depends on !GCC_PLUGIN_RANDSTRUCT || COMPILE_TEST
+	help
+	  Export BTF in sysfs for userspace relocation of BPF programs.
+	  Keep in-kernel BTF verification disabled. Requires pahole.
+
 config GDB_SCRIPTS
 	bool "Provide GDB scripts for kernel debugging"
 	depends on DEBUG_INFO
